@@ -829,18 +829,14 @@ pub const Loop = struct {
             .accept => |*v| {
                 if (completion.flags.state == .active) {
                     const result = windows.kernel32.CancelIoEx(asSocket(v.socket), &completion.overlapped);
-                    cancel_result.?.* = if (result == windows.FALSE)
-                        windows.unexpectedError(windows.kernel32.GetLastError())
-                    else {};
+                    cancel_result.?.* = cancelResult(result);
                 }
             },
 
             inline .read, .pread, .write, .pwrite, .recv, .send, .sendto, .recvfrom => |*v| {
                 if (completion.flags.state == .active) {
                     const result = windows.kernel32.CancelIoEx(asSocket(v.fd), &completion.overlapped);
-                    cancel_result.?.* = if (result == windows.FALSE)
-                        windows.unexpectedError(windows.kernel32.GetLastError())
-                    else {};
+                    cancel_result.?.* = cancelResult(result);
                 }
             },
 
@@ -878,6 +874,19 @@ pub const Loop = struct {
 /// Convenience to convert from windows.HANDLE to windows.ws2_32.SOCKET (which are the same thing).
 inline fn asSocket(h: windows.HANDLE) windows.ws2_32.SOCKET {
     return @as(windows.ws2_32.SOCKET, @ptrCast(h));
+}
+
+/// Map a CancelIoEx return into a CancelError!void. NOT_FOUND means the
+/// target I/O already completed kernel-side -- per MS docs, the cancel
+/// did its job and there is nothing left to wait on.
+/// https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex
+fn cancelResult(cancel_io_ex_result: windows.BOOL) CancelError!void {
+    if (cancel_io_ex_result != windows.FALSE) return;
+    const err = windows.kernel32.GetLastError();
+    return switch (err) {
+        windows.Win32Error.NOT_FOUND => {},
+        else => windows.unexpectedError(err),
+    };
 }
 
 fn iocpShutdown(sock: windows.ws2_32.SOCKET, how: ShutdownHow) ShutdownError!void {
