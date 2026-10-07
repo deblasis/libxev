@@ -1873,13 +1873,15 @@ const CancelBeforeStart = struct {
     victim_cancel: Completion = .{},
     victim_calls: usize = 0,
     victim_last: ?TimerTrigger = null,
+    /// Re-arm the victim, due at once, from its own cancel callback.
+    rearm_on_cancel: bool = false,
 
     kicker: Completion = .{},
     /// What the kicker saw the victim's state as.
     seen: ?CompletionState = null,
     /// Re-arm the victim from the kicker if it reads dead, the way a
     /// caller that trusts state() would.
-    rearm: bool = false,
+    rearm_if_dead: bool = false,
 
     fn setup(self: *CancelBeforeStart, loop: *Loop) void {
         loop.timer(&self.victim, 100_000, self, victimCallback);
@@ -1892,20 +1894,33 @@ const CancelBeforeStart = struct {
         self.kicker.op.timer.next = 0;
     }
 
-    fn victimCallback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+    fn victimCallback(ud: ?*anyopaque, l: *Loop, _: *Completion, r: Result) CallbackAction {
         const self: *CancelBeforeStart = @ptrCast(@alignCast(ud.?));
         self.victim_calls += 1;
         self.victim_last = r.timer catch unreachable;
+        if (self.rearm_on_cancel and self.victim_last.? == .cancel) {
+            l.timer(&self.victim, 0, self, victimCallback);
+            self.victim.op.timer.next = 0;
+        }
         return .disarm;
     }
 
     fn kickerCallback(ud: ?*anyopaque, l: *Loop, _: *Completion, _: Result) CallbackAction {
         const self: *CancelBeforeStart = @ptrCast(@alignCast(ud.?));
         self.seen = self.victim.state();
-        if (self.rearm and self.seen.? == .dead) {
+        if (self.rearm_if_dead and self.seen.? == .dead) {
             l.timer(&self.victim, 100_000, self, victimCallback);
         }
         return .disarm;
+    }
+
+    /// Tick until the loop is done, but boundedly: a loop whose active
+    /// count is off never becomes done, and that must fail the test
+    /// rather than hang it.
+    fn drain(loop: *Loop) !void {
+        var ticks: usize = 0;
+        while (!loop.done() and ticks < 8) : (ticks += 1) try loop.run(.no_wait);
+        try std.testing.expect(loop.done());
     }
 };
 
@@ -1917,7 +1932,7 @@ test "iocp: a timer canceled before it started reads active until its callback" 
 
     var t: CancelBeforeStart = .{};
     t.setup(&loop);
-    try loop.run(.until_done);
+    try CancelBeforeStart.drain(&loop);
 
     // The victim's cancel callback was still pending when the kicker
     // ran, so the victim must not have looked reusable.
@@ -1928,19 +1943,23 @@ test "iocp: a timer canceled before it started reads active until its callback" 
     try testing.expect(t.victim_cancel.state() == .dead);
 }
 
-test "iocp: re-arming a timer canceled before it started, from the same tick" {
+test "iocp: a timer canceled before it started is re-armed from its cancel callback" {
     const testing = std.testing;
 
     var loop = try Loop.init(.{});
     defer loop.deinit();
 
-    var t: CancelBeforeStart = .{ .rearm = true };
+    // The kicker re-arms the victim if it reads dead, which used to wipe
+    // it out from under the completions queue. The victim re-arms itself
+    // from its cancel callback, where it is off every queue.
+    var t: CancelBeforeStart = .{ .rearm_if_dead = true, .rearm_on_cancel = true };
     t.setup(&loop);
-    try loop.run(.until_done);
+    try CancelBeforeStart.drain(&loop);
 
-    try testing.expectEqual(@as(usize, 1), t.victim_calls);
-    try testing.expectEqual(@as(?TimerTrigger, .cancel), t.victim_last);
-    try testing.expect(loop.done());
+    try testing.expectEqual(@as(?CompletionState, .active), t.seen);
+    try testing.expectEqual(@as(usize, 2), t.victim_calls);
+    try testing.expectEqual(@as(?TimerTrigger, .expiration), t.victim_last);
+    try testing.expect(t.victim.state() == .dead);
 }
 
 test "iocp: noop" {
