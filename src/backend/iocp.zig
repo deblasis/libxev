@@ -815,6 +815,18 @@ pub const Loop = struct {
                         self.add(completion);
                         return;
                     }
+                } else {
+                    // Canceled before it was ever started: submit found it
+                    // dead in the submission queue. It is about to wait in
+                    // the completions queue for its callback, and until
+                    // then it must not read as dead: a callback that runs
+                    // first in this tick (an expiring timer) would take it
+                    // as free and re-initialize it in place, wiping the
+                    // result and the queue link out from under the
+                    // completions queue. Make it active, exactly like a
+                    // timer canceled from the heap.
+                    completion.flags.state = .active;
+                    self.active += 1;
                 }
 
                 // Add to our completion so we trigger the callback.
@@ -1850,6 +1862,85 @@ test "iocp: canceling a completed operation" {
     try loop.run(.until_done);
     try testing.expect(called);
     try testing.expect(trigger.? == .expiration);
+}
+
+/// Shared by the two "canceled before it started" tests below: a timer
+/// that is canceled while still in the submission queue, plus a second
+/// timer that is already due and so runs its callback in the same tick,
+/// before the canceled one has had its callback.
+const CancelBeforeStart = struct {
+    victim: Completion = .{},
+    victim_cancel: Completion = .{},
+    victim_calls: usize = 0,
+    victim_last: ?TimerTrigger = null,
+
+    kicker: Completion = .{},
+    /// What the kicker saw the victim's state as.
+    seen: ?CompletionState = null,
+    /// Re-arm the victim from the kicker if it reads dead, the way a
+    /// caller that trusts state() would.
+    rearm: bool = false,
+
+    fn setup(self: *CancelBeforeStart, loop: *Loop) void {
+        loop.timer(&self.victim, 100_000, self, victimCallback);
+        self.victim_cancel = .{ .op = .{ .cancel = .{ .c = &self.victim } } };
+        loop.add(&self.victim_cancel);
+
+        loop.timer(&self.kicker, 0, self, kickerCallback);
+        // Due from the start, so the first tick fires it without
+        // depending on the clock moving between add and tick.
+        self.kicker.op.timer.next = 0;
+    }
+
+    fn victimCallback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+        const self: *CancelBeforeStart = @ptrCast(@alignCast(ud.?));
+        self.victim_calls += 1;
+        self.victim_last = r.timer catch unreachable;
+        return .disarm;
+    }
+
+    fn kickerCallback(ud: ?*anyopaque, l: *Loop, _: *Completion, _: Result) CallbackAction {
+        const self: *CancelBeforeStart = @ptrCast(@alignCast(ud.?));
+        self.seen = self.victim.state();
+        if (self.rearm and self.seen.? == .dead) {
+            l.timer(&self.victim, 100_000, self, victimCallback);
+        }
+        return .disarm;
+    }
+};
+
+test "iocp: a timer canceled before it started reads active until its callback" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var t: CancelBeforeStart = .{};
+    t.setup(&loop);
+    try loop.run(.until_done);
+
+    // The victim's cancel callback was still pending when the kicker
+    // ran, so the victim must not have looked reusable.
+    try testing.expectEqual(@as(?CompletionState, .active), t.seen);
+    try testing.expectEqual(@as(usize, 1), t.victim_calls);
+    try testing.expectEqual(@as(?TimerTrigger, .cancel), t.victim_last);
+    try testing.expect(t.victim.state() == .dead);
+    try testing.expect(t.victim_cancel.state() == .dead);
+}
+
+test "iocp: re-arming a timer canceled before it started, from the same tick" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var t: CancelBeforeStart = .{ .rearm = true };
+    t.setup(&loop);
+    try loop.run(.until_done);
+
+    try testing.expectEqual(@as(usize, 1), t.victim_calls);
+    try testing.expectEqual(@as(?TimerTrigger, .cancel), t.victim_last);
+    try testing.expect(loop.done());
 }
 
 test "iocp: noop" {
